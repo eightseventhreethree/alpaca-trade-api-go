@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -12,9 +13,9 @@ import (
 	"time"
 
 	"github.com/alpacahq/alpaca-trade-api-go/common"
-	"github.com/gorilla/websocket"
 	"github.com/mitchellh/mapstructure"
 	"github.com/vmihailenco/msgpack/v5"
+	"nhooyr.io/websocket"
 )
 
 const (
@@ -136,17 +137,14 @@ func (s *datav2stream) close() error {
 	s.wsWriteMutex.Lock()
 	defer s.wsWriteMutex.Unlock()
 
-	if err := s.conn.WriteMessage(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-	); err != nil {
+	if err := s.conn.Close(websocket.StatusNormalClosure, ""); err != nil {
 		return err
 	}
 
 	// so we know it was gracefully closed
 	s.closed.Store(true)
 
-	return s.conn.Close()
+	return nil
 }
 
 func (s *datav2stream) ensureRunning() error {
@@ -194,11 +192,11 @@ func (s *datav2stream) reconnect() error {
 func (s *datav2stream) readForever() {
 	for {
 		s.wsReadMutex.Lock()
-		msgType, b, err := s.conn.ReadMessage()
+		msgType, b, err := s.conn.Read(context.TODO())
 		s.wsReadMutex.Unlock()
 
 		if err != nil {
-			if websocket.IsCloseError(err) {
+			if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
 				// if this was a graceful closure, don't reconnect
 				if s.closed.Load().(bool) {
 					return
@@ -212,7 +210,7 @@ func (s *datav2stream) readForever() {
 				panic(err)
 			}
 		}
-		if msgType != websocket.BinaryMessage {
+		if msgType != websocket.MessageBinary {
 			continue
 		}
 
@@ -249,8 +247,12 @@ func (s *datav2stream) handleMsg(msg map[string]interface{}) error {
 
 		handler, ok := s.tradeHandlers[symbol]
 		if !ok {
-			return errors.New("trade handler missing for symbol: " + symbol)
+			handler, ok = s.tradeHandlers["*"]
+			if !ok {
+				return errors.New("trade handler missing for symbol: " + symbol)
+			}
 		}
+
 		var trade Trade
 		if err := mapstructure.Decode(msg, &trade); err != nil {
 			return err
@@ -268,14 +270,19 @@ func (s *datav2stream) handleMsg(msg map[string]interface{}) error {
 
 		handler, ok := s.quoteHandlers[symbol]
 		if !ok {
-			return errors.New("quote handler missing for symbol: " + symbol)
+			handler, ok = s.quoteHandlers["*"]
+			if !ok {
+				return errors.New("quote handler missing for symbol: " + symbol)
+			}
 		}
+
 		var quote Quote
 		if err := mapstructure.Decode(msg, &quote); err != nil {
 			return err
 		}
 		handler(quote)
 	}
+	// TODO: bars
 	return nil
 }
 
@@ -306,7 +313,7 @@ func (s *datav2stream) handleSubscription(subscribe bool, trades []string, quote
 	s.wsWriteMutex.Lock()
 	defer s.wsWriteMutex.Unlock()
 
-	if err := s.conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+	if err := s.conn.Write(context.TODO(), websocket.MessageBinary, msg); err != nil {
 		return err
 	}
 
@@ -322,7 +329,7 @@ func (s *datav2stream) auth() (err error) {
 		return
 	}
 
-	authMsg, err := msgpack.Marshal(map[string]string{
+	msg, err := msgpack.Marshal(map[string]string{
 		"action": "auth",
 		"key":    common.Credentials().ID,
 		"secret": common.Credentials().Secret,
@@ -334,20 +341,20 @@ func (s *datav2stream) auth() (err error) {
 	s.wsWriteMutex.Lock()
 	defer s.wsWriteMutex.Unlock()
 
-	if err := s.conn.WriteMessage(websocket.BinaryMessage, authMsg); err != nil {
+	if err := s.conn.Write(context.TODO(), websocket.MessageBinary, msg); err != nil {
 		return err
 	}
 
 	var resps []map[string]interface{}
 
 	// ensure the auth response comes in a timely manner
-	s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	defer s.conn.SetReadDeadline(time.Time{})
+	ctx, cancel := context.WithTimeout(context.TODO(), 5*time.Second)
+	defer cancel()
 
 	s.wsReadMutex.Lock()
 	defer s.wsReadMutex.Unlock()
 
-	_, b, err := s.conn.ReadMessage()
+	_, b, err := s.conn.Read(ctx)
 	if err != nil {
 		return err
 	}
@@ -375,8 +382,11 @@ func openSocket() (*websocket.Conn, error) {
 	}
 	u := url.URL{Scheme: scheme, Host: ub.Host, Path: "/v2/stream/" + strings.ToLower(DataFeed)}
 	for attempts := 1; attempts <= MaxConnectionAttempts; attempts++ {
-		c, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{
-			"Content-Type": []string{"application/msgpack"},
+		c, _, err := websocket.Dial(context.TODO(), u.String(), &websocket.DialOptions{
+			CompressionMode: websocket.CompressionContextTakeover,
+			HTTPHeader: http.Header{
+				"Content-Type": []string{"application/msgpack"},
+			},
 		})
 		if err == nil {
 			return c, readConnected(c)
@@ -391,7 +401,7 @@ func openSocket() (*websocket.Conn, error) {
 }
 
 func readConnected(conn *websocket.Conn) error {
-	_, b, err := conn.ReadMessage()
+	_, b, err := conn.Read(context.TODO())
 	if err != nil {
 		return err
 	}
