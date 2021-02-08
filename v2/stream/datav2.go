@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -27,9 +28,6 @@ var (
 	// DataStreamURL is the URL for the data websocket stream.
 	// The DATA_PROXY_WS environment variable overrides it.
 	DataStreamURL = "https://data.alpaca.markets" // TODO: Probably this URL will change.
-
-	// DataFeed is the selected data feed. Default: SIP.
-	DataFeed = "SIP" // TODO: Figure this out based on the account
 )
 
 var (
@@ -37,17 +35,24 @@ var (
 )
 
 type datav2stream struct {
+	// opts
+	feed string
+
+	// connection flow
 	conn          *websocket.Conn
 	authenticated atomic.Value
 	closed        atomic.Value
+
+	// handlers
 	tradeHandlers map[string]func(trade Trade)
 	quoteHandlers map[string]func(quote Quote)
-	// TODO: add barsHandler
+	barHandlers   map[string]func(bar Bar)
+
 	// concurrency
 	readerOnce    sync.Once
 	wsWriteMutex  sync.Mutex
 	wsReadMutex   sync.Mutex
-	handlersMutex sync.Mutex
+	handlersMutex sync.RWMutex
 }
 
 func newDatav2Stream() *datav2stream {
@@ -55,15 +60,32 @@ func newDatav2Stream() *datav2stream {
 		DataStreamURL = s
 	}
 	stream = &datav2stream{
+		feed:          "iex",
 		authenticated: atomic.Value{},
 		tradeHandlers: make(map[string]func(trade Trade)),
 		quoteHandlers: make(map[string]func(quote Quote)),
+		barHandlers:   make(map[string]func(bar Bar)),
 	}
 
 	stream.authenticated.Store(false)
 	stream.closed.Store(false)
 
 	return stream
+}
+
+func (s *datav2stream) useFeed(feed string) error {
+	feed = strings.ToLower(feed)
+	switch feed {
+	case "iex", "sip":
+	default:
+		return errors.New("unsupported feed: " + feed)
+	}
+	if s.feed == feed {
+		return nil
+	}
+	s.feed = feed
+	s.reconnect()
+	return nil
 }
 
 func (s *datav2stream) subscribeTrades(handler func(trade Trade), symbols ...string) error {
@@ -104,7 +126,24 @@ func (s *datav2stream) subscribeQuotes(handler func(quote Quote), symbols ...str
 	return nil
 }
 
-// TODO: add subscribeBars
+func (s *datav2stream) subscribeBars(handler func(bar Bar), symbols ...string) error {
+	if err := s.ensureRunning(); err != nil {
+		return err
+	}
+
+	if err := s.sub(nil, nil, symbols); err != nil {
+		return err
+	}
+
+	s.handlersMutex.Lock()
+	defer s.handlersMutex.Unlock()
+
+	for _, symbol := range symbols {
+		s.barHandlers[symbol] = handler
+	}
+
+	return nil
+}
 
 func (s *datav2stream) unsubscribe(trades []string, quotes []string, bars []string) error {
 	if err := s.ensureRunning(); err != nil {
@@ -120,7 +159,9 @@ func (s *datav2stream) unsubscribe(trades []string, quotes []string, bars []stri
 	for _, quote := range quotes {
 		delete(s.quoteHandlers, quote)
 	}
-	// TODO: bars
+	for _, bar := range bars {
+		delete(s.barHandlers, bar)
+	}
 
 	if err := s.unsub(trades, quotes, bars); err != nil {
 		return err
@@ -150,7 +191,7 @@ func (s *datav2stream) close() error {
 func (s *datav2stream) ensureRunning() error {
 	var err error
 	if s.conn == nil {
-		s.conn, err = openSocket()
+		s.conn, err = openSocket(s.feed)
 		if err != nil {
 			return err
 		}
@@ -167,7 +208,7 @@ func (s *datav2stream) ensureRunning() error {
 
 func (s *datav2stream) reconnect() error {
 	s.authenticated.Store(false)
-	conn, err := openSocket()
+	conn, err := openSocket(s.feed)
 	if err != nil {
 		return err
 	}
@@ -184,7 +225,9 @@ func (s *datav2stream) reconnect() error {
 		quotes = append(quotes, quote)
 	}
 	bars := make([]string, 0)
-	// TODO: bars
+	for bar := range s.barHandlers {
+		bars = append(bars, bar)
+	}
 
 	return s.sub(trades, quotes, bars)
 }
@@ -236,14 +279,25 @@ func (s *datav2stream) handleMsg(msg map[string]interface{}) error {
 	}
 
 	switch T {
+	case "t", "q", "b":
+	default:
+		return nil
+	}
+
+	symbol, ok := msg["S"].(string)
+	if !ok {
+		return errors.New("unexpected message: S missing")
+	}
+
+	switch T {
 	case "t":
-		symbol, ok := msg["S"].(string)
-		if !ok {
-			return errors.New("unexpected message: S missing")
+		var trade Trade
+		if err := mapstructure.Decode(msg, &trade); err != nil {
+			return err
 		}
 
-		s.handlersMutex.Lock()
-		defer s.handlersMutex.Unlock()
+		s.handlersMutex.RLock()
+		defer s.handlersMutex.RUnlock()
 
 		handler, ok := s.tradeHandlers[symbol]
 		if !ok {
@@ -252,22 +306,15 @@ func (s *datav2stream) handleMsg(msg map[string]interface{}) error {
 				return errors.New("trade handler missing for symbol: " + symbol)
 			}
 		}
-
-		var trade Trade
-		if err := mapstructure.Decode(msg, &trade); err != nil {
+		handler(trade)
+	case "q":
+		var quote Quote
+		if err := mapstructure.Decode(msg, &quote); err != nil {
 			return err
 		}
 
-		handler(trade)
-	case "q":
-		symbol, ok := msg["S"].(string)
-		if !ok {
-			return errors.New("unexpected message: S missing")
-		}
-
-		s.handlersMutex.Lock()
-		defer s.handlersMutex.Unlock()
-
+		s.handlersMutex.RLock()
+		defer s.handlersMutex.RUnlock()
 		handler, ok := s.quoteHandlers[symbol]
 		if !ok {
 			handler, ok = s.quoteHandlers["*"]
@@ -275,14 +322,25 @@ func (s *datav2stream) handleMsg(msg map[string]interface{}) error {
 				return errors.New("quote handler missing for symbol: " + symbol)
 			}
 		}
-
-		var quote Quote
-		if err := mapstructure.Decode(msg, &quote); err != nil {
+		handler(quote)
+	case "b":
+		var bar Bar
+		if err := mapstructure.Decode(msg, &bar); err != nil {
 			return err
 		}
-		handler(quote)
+
+		s.handlersMutex.RLock()
+		defer s.handlersMutex.RUnlock()
+
+		handler, ok := s.barHandlers[symbol]
+		if !ok {
+			handler, ok = s.barHandlers["*"]
+			if !ok {
+				return errors.New("quote handler missing for symbol: " + symbol)
+			}
+		}
+		handler(bar)
 	}
-	// TODO: bars
 	return nil
 }
 
@@ -373,14 +431,15 @@ func (s *datav2stream) auth() (err error) {
 	return
 }
 
-func openSocket() (*websocket.Conn, error) {
+func openSocket(feed string) (*websocket.Conn, error) {
 	scheme := "wss"
 	ub, _ := url.Parse(DataStreamURL)
 	switch ub.Scheme {
 	case "http", "ws":
 		scheme = "ws"
 	}
-	u := url.URL{Scheme: scheme, Host: ub.Host, Path: "/v2/stream/" + strings.ToLower(DataFeed)}
+	u := url.URL{Scheme: scheme, Host: ub.Host, Path: "/v2/stream/" + strings.ToLower(feed)}
+	fmt.Println(u.String())
 	for attempts := 1; attempts <= MaxConnectionAttempts; attempts++ {
 		c, _, err := websocket.Dial(context.TODO(), u.String(), &websocket.DialOptions{
 			CompressionMode: websocket.CompressionContextTakeover,

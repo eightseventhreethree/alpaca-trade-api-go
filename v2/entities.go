@@ -28,7 +28,7 @@ type Quote struct {
 	AskPrice    float64   `json:"ap"`
 	AskSize     uint32    `json:"as"`
 	Timestamp   time.Time `json:"t"`
-	Condition   string    `json:"c"`
+	Conditions  []string  `json:"c"`
 	Tape        string    `json:"z"`
 }
 

@@ -24,8 +24,17 @@ type Quote struct {
 	AskPrice    float64   `mapstructure:"ap"`
 	AskSize     uint32    `mapstructure:"as"`
 	Timestamp   time.Time `mapstructure:"t"`
-	Condition   string    `mapstructure:"c"`
+	Conditions  []string  `mapstructure:"c"`
 	Tape        string    `mapstructure:"z"`
 }
 
-// TODO: Add bars
+// Bar is an aggregate of trades
+type Bar struct {
+	Symbol    string    `mapstructure:"S"`
+	Open      float64   `mapstructure:"o"`
+	High      float64   `mapstructure:"h"`
+	Low       float64   `mapstructure:"l"`
+	Close     float64   `mapstructure:"c"`
+	Volume    uint64    `mapstructure:"v"`
+	Timestamp time.Time `mapstructure:"t"`
+}

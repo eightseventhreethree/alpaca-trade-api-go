@@ -21,15 +21,21 @@ func main() {
 		os.Setenv(common.EnvApiSecretKey, apiSecret)
 	}
 
+	stream.UseFeed("sip")
+
 	if err := stream.SubscribeTradeUpdates(tradeUpdateHandler); err != nil {
 		panic(err)
 	}
 
-	if err := stream.SubscribeTrades(tradeHandler, "AAPL"); err != nil {
-		panic(err)
-	}
+	// if err := stream.SubscribeTrades(tradeHandler, "AAPL"); err != nil {
+	// 	panic(err)
+	// }
 
-	if err := stream.SubscribeQuotes(quoteHandler, "AAPL", "MSFT", "IBM"); err != nil {
+	// if err := stream.SubscribeQuotes(quoteHandler, "*"); err != nil {
+	// 	panic(err)
+	// }
+
+	if err := stream.SubscribeBars(barHandler, "*"); err != nil {
 		panic(err)
 	}
 
@@ -46,4 +52,8 @@ func tradeHandler(trade stream.Trade) {
 
 func quoteHandler(quote stream.Quote) {
 	fmt.Println("quote", quote)
+}
+
+func barHandler(quote stream.Bar) {
+	fmt.Println("bar", quote)
 }
